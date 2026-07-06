@@ -109,20 +109,14 @@ export function useRequestForm({ profile, lookups }) {
         return_status: returnStatus,
         submitted_at: new Date().toISOString(),
       }
+      // The DB seeds the pending approval rows via trigger (seed_request_approvals),
+      // so the client only needs to insert the request itself.
       const { data, error } = await supabase
         .from('requests')
         .insert(payload)
         .select('id, reference, status')
         .single()
       if (error) throw error
-
-      // Pre-create the pending approval rows for the workflow.
-      const stages = requestType === 'material'
-        ? ['line_manager', 'admin']
-        : ['line_manager']
-      await supabase.from('request_approvals').insert(
-        stages.map((stage) => ({ request_id: data.id, stage })),
-      )
 
       setSubmitted(data)
     } catch (err) {

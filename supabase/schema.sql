@@ -213,62 +213,278 @@ alter table request_status_history  enable row level security;
 alter table stock_items             enable row level security;
 alter table cost_centers            enable row level security;
 
--- helper: current user's role
-create or replace function current_role_is(target user_role)
-returns boolean language sql stable security definer set search_path = public as $$
-  select exists (select 1 from profiles where id = auth.uid() and role = target);
+-- helpers ------------------------------------------------------------------
+-- current user's role (security definer so RLS on profiles doesn't recurse)
+create or replace function my_role()
+returns user_role language sql stable security definer set search_path = public as $$
+  select role from profiles where id = auth.uid();
 $$;
 
--- profiles: read own + anyone you manage; everyone can read basic directory
+create or replace function current_role_is(target user_role)
+returns boolean language sql stable security definer set search_path = public as $$
+  select my_role() = target;
+$$;
+
+-- is the given request submitted by one of MY direct reports? (doc §2.2)
+create or replace function is_my_report(p_requestor uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from profiles where id = p_requestor and line_manager_id = auth.uid()
+  );
+$$;
+
+-- ---- profiles --------------------------------------------------------------
+-- Everyone can read the directory; you may edit your own profile, but you may
+-- NOT change your own role (role is assigned by admin/management only, doc §2).
 create policy "profiles readable by authenticated"
   on profiles for select to authenticated using (true);
-create policy "update own profile"
-  on profiles for update to authenticated using (id = auth.uid());
 
--- requests: officer sees own; approvers see requests routed to their stage/role
+create policy "update own profile"
+  on profiles for update to authenticated
+  using (id = auth.uid())
+  with check (id = auth.uid());
+
+create policy "admin manages profiles"
+  on profiles for all to authenticated
+  using (current_role_is('management') or current_role_is('admin'))
+  with check (current_role_is('management') or current_role_is('admin'));
+
+-- Guard: block self role-escalation even through the "update own profile" path.
+create or replace function guard_role_change()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.role is distinct from old.role
+     and not (current_role_is('management') or current_role_is('admin')) then
+    raise exception 'Only admin or management may change a user role';
+  end if;
+  return new;
+end;
+$$;
+
+create trigger profiles_guard_role
+  before update on profiles
+  for each row execute function guard_role_change();
+
+-- ---- requests: read model (mirrors the doc's routing) ----------------------
+-- Officer: only their own requests (doc §2.1)
 create policy "requestor reads own requests"
   on requests for select to authenticated
   using (requestor_id = auth.uid());
 
-create policy "approvers read routed requests"
+-- Line Manager: requests from their direct reports (doc §2.2)
+create policy "line manager reads reports' requests"
+  on requests for select to authenticated
+  using (current_role_is('line_manager') and is_my_report(requestor_id));
+
+-- Admin Team: MATERIAL requests only, once past the line manager (doc §2.3)
+create policy "admin reads material requests"
   on requests for select to authenticated
   using (
-    current_role_is('management')
-    or (current_role_is('admin') and current_stage = 'admin')
-    or (current_role_is('line_manager') and current_stage = 'line_manager'
-        and requestor_id in (select id from profiles where line_manager_id = auth.uid()))
+    current_role_is('admin')
+    and request_type = 'material'
+    and current_stage in ('admin', 'management')
   );
 
+-- Management: everything (doc §2.4, final authority)
+create policy "management reads all requests"
+  on requests for select to authenticated
+  using (current_role_is('management'));
+
+-- ---- requests: write model -------------------------------------------------
+-- Officers create their own requests.
 create policy "requestor inserts own requests"
   on requests for insert to authenticated
   with check (requestor_id = auth.uid());
 
--- Requestor may edit only while draft/returned; approvers may move it along.
+-- Officers may edit ONLY while the request is theirs to fix (draft / returned).
 create policy "requestor edits editable requests"
   on requests for update to authenticated
   using (requestor_id = auth.uid() and status in ('draft', 'returned_for_correction'))
   with check (requestor_id = auth.uid());
 
-create policy "approvers update routed requests"
-  on requests for update to authenticated
-  using (
-    current_role_is('management')
-    or (current_role_is('admin') and current_stage = 'admin')
-    or (current_role_is('line_manager') and current_stage = 'line_manager')
-  );
+-- NOTE: approvers do NOT get a blanket UPDATE policy. All approval transitions
+-- (approve / reject / send back / forward) go through decide_request() below,
+-- which enforces role + stage rules. This prevents a client from setting an
+-- arbitrary status or skipping a stage.
 
--- approvals + history: visible to anyone who can see the parent request
+-- ---- approvals + history (read-only to clients; written by the RPC) --------
 create policy "read approvals for visible requests"
   on request_approvals for select to authenticated
   using (exists (select 1 from requests r where r.id = request_id));
-create policy "approvers write approvals"
-  on request_approvals for all to authenticated
-  using (current_role_is('line_manager') or current_role_is('admin') or current_role_is('management'))
-  with check (current_role_is('line_manager') or current_role_is('admin') or current_role_is('management'));
 
 create policy "read history for visible requests"
   on request_status_history for select to authenticated
   using (exists (select 1 from requests r where r.id = request_id));
+
+-- ============================================================================
+-- Workflow enforcement  (doc §2 roles + §3/§4/§5 flows + §7 approval rules)
+--
+-- decide_request() is the ONLY way an approval decision is applied. It checks
+-- that the caller's role matches the stage the request is currently sitting at,
+-- records the decision on request_approvals, and advances the request exactly
+-- as the doc prescribes:
+--
+--   line_manager  approve  -> general: APPROVED (done)     [doc §3.1]
+--                            material: -> Admin (pending_admin) [doc §4.2/§5.2]
+--                 forward  -> Management (pending_management)   [doc §2.2/§7.1]
+--   admin         approve  -> APPROVED (approved requisition)   [doc §4.2/§7.2]
+--                 forward  -> Management (pending_management)   [doc §2.3/§7.2]
+--   management    approve  -> APPROVED (final)                  [doc §2.4/§7.3]
+--   any stage     reject   -> REJECTED
+--                 return   -> RETURNED_FOR_CORRECTION (back to officer) [doc §2.2]
+-- ============================================================================
+create or replace function decide_request(
+  p_request uuid,
+  p_action  text,               -- 'approve' | 'reject' | 'return' | 'forward'
+  p_comment text default null
+)
+returns requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  r        requests;
+  v_role   user_role := my_role();
+  v_stage  approval_stage;
+  v_next_status  request_status;
+  v_next_stage   approval_stage;
+  v_decision     approval_decision;
+begin
+  select * into r from requests where id = p_request for update;
+  if not found then
+    raise exception 'Request not found';
+  end if;
+
+  v_stage := r.current_stage;
+  if v_stage is null then
+    raise exception 'Request % is already finalized (status %)', r.reference, r.status;
+  end if;
+
+  -- --- authorization: caller must own the current stage (management may act
+  --     on any stage as the final authority, doc §2.4) ------------------------
+  if v_role <> 'management' then
+    if v_stage = 'line_manager' then
+      if not (v_role = 'line_manager' and is_my_report(r.requestor_id)) then
+        raise exception 'Only the requestor''s line manager may act at this stage';
+      end if;
+    elsif v_stage = 'admin' then
+      if not (v_role = 'admin' and r.request_type = 'material') then
+        raise exception 'Only the Admin Team may act on material requests at this stage';
+      end if;
+    elsif v_stage = 'management' then
+      raise exception 'Only Management may act at the management stage';
+    end if;
+  end if;
+
+  -- --- resolve the transition -------------------------------------------------
+  if p_action = 'reject' then
+    v_decision := 'rejected'; v_next_status := 'rejected'; v_next_stage := null;
+
+  elsif p_action = 'return' then
+    v_decision := 'returned'; v_next_status := 'returned_for_correction'; v_next_stage := null;
+
+  elsif p_action = 'forward' then
+    if v_stage = 'management' then
+      raise exception 'Cannot forward beyond Management';
+    end if;
+    v_decision := 'forwarded'; v_next_status := 'pending_management'; v_next_stage := 'management';
+
+  elsif p_action = 'approve' then
+    v_decision := 'approved';
+    if v_stage = 'line_manager' then
+      if r.request_type = 'material' then
+        v_next_status := 'pending_admin';  v_next_stage := 'admin';       -- doc §4.2/§5.2
+      else
+        v_next_status := 'approved';       v_next_stage := null;          -- doc §3.1 (no admin)
+      end if;
+    else            -- admin or management approving
+      v_next_status := 'approved';         v_next_stage := null;          -- approved requisition
+    end if;
+
+  else
+    raise exception 'Unknown action: %', p_action;
+  end if;
+
+  -- --- record the decision on the current stage -------------------------------
+  insert into request_approvals (request_id, stage, approver_id, decision, comment, decided_at)
+  values (r.id, v_stage, auth.uid(), v_decision, p_comment, now())
+  on conflict (request_id, stage) do update
+    set approver_id = excluded.approver_id,
+        decision    = excluded.decision,
+        comment     = excluded.comment,
+        decided_at  = excluded.decided_at;
+
+  -- Make sure a pending management row exists when forwarding.
+  if v_next_stage = 'management' then
+    insert into request_approvals (request_id, stage)
+    values (r.id, 'management')
+    on conflict (request_id, stage) do nothing;
+  end if;
+
+  -- --- advance the request (status-history trigger logs the change) -----------
+  update requests
+     set status = v_next_status,
+         current_stage = v_next_stage
+   where id = r.id
+  returning * into r;
+
+  return r;
+end;
+$$;
+
+grant execute on function decide_request(uuid, text, text) to authenticated;
+
+-- Admin/Management mark a returnable "Use Material" item as returned (doc §5.2/§6).
+create or replace function mark_item_returned(p_request uuid)
+returns requests
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare r requests;
+begin
+  if not (current_role_is('admin') or current_role_is('management')) then
+    raise exception 'Only Admin or Management may record a return';
+  end if;
+  update requests
+     set return_status = 'returned',
+         status = 'completed'
+   where id = p_request and return_status = 'pending_return'
+  returning * into r;
+  if not found then
+    raise exception 'Request is not awaiting a return';
+  end if;
+  return r;
+end;
+$$;
+
+grant execute on function mark_item_returned(uuid) to authenticated;
+
+-- When a request is submitted (leaves 'draft'), seed its pending approval rows
+-- server-side so clients never need write access to request_approvals.
+-- Line Manager for every request; Admin too for material requests (doc §4/§5).
+create or replace function seed_request_approvals()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if new.status <> 'draft' and (tg_op = 'INSERT' or old.status = 'draft') then
+    insert into request_approvals (request_id, stage)
+    values (new.id, 'line_manager')
+    on conflict (request_id, stage) do nothing;
+
+    if new.request_type = 'material' then
+      insert into request_approvals (request_id, stage)
+      values (new.id, 'admin')
+      on conflict (request_id, stage) do nothing;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger requests_seed_approvals
+  after insert or update on requests
+  for each row execute function seed_request_approvals();
 
 -- lookups: readable by all authenticated, writable by admin/management
 create policy "read stock items" on stock_items for select to authenticated using (true);
